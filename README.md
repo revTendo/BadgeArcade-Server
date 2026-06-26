@@ -1,2 +1,2 @@
 # BadgeArcade-Server
-server for badge arcade and setup guide
+server for badge arcade

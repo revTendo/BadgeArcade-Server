@@ -66,3 +66,12 @@ def object_size(key: str) -> int:
         return os.path.getsize(path)
     except OSError:
         return 0
+
+
+def write_object(key: str, data: bytes):
+    """Write a blob directly to the file-server storage so the 3DS can GET it."""
+    path = os.path.join(config.storage_path(), os.path.normpath(key))
+    os.makedirs(os.path.dirname(path) or config.storage_path(), exist_ok=True)
+    with open(path, "wb") as f:
+        f.write(data)
+    log.debug("Stored object %s (%d bytes)", key, len(data))

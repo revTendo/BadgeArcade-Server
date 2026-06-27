@@ -13,7 +13,9 @@ import config
 log = logging.getLogger(__name__)
 
 PING_INTERVAL = 5.0
-PING_TIMEOUT  = 12.0
+# The 3DS goes silent for long stretches (e.g. the ~2 min catalog download),
+# so the idle timeout must be generous — only tear down truly dead connections.
+CONNECTION_IDLE_TIMEOUT = 300.0
 CD_ML         = b'CD&ML'
 
 TYPE_NAMES = ['SYN','CONNECT','DATA','DISCONNECT','PING','USER','ROUTE','RAW']
@@ -85,6 +87,8 @@ class PRUDPServer:
 
     def _route(self, p, addr):
         conn = self.conns.get(addr)
+        if conn is not None:
+            conn.last_ack = time.monotonic()   # any packet means the client is alive
 
         if p.has_flag(pkt.FLAG_MULTI_ACK):
             if conn:
@@ -111,6 +115,7 @@ class PRUDPServer:
         elif p.ptype == pkt.TYPE_DATA and conn and conn.state == Connection.STATE_CONNECTED:
             self._data(p, addr, conn)
         elif p.ptype == pkt.TYPE_PING and conn:
+            conn.last_ack = time.monotonic()   # client is alive
             self._ack(conn, p)
         elif p.ptype == pkt.TYPE_DISCONNECT and conn:
             if p.has_flag(pkt.FLAG_NEED_ACK):
@@ -141,6 +146,14 @@ class PRUDPServer:
                 conn.pending.pop(key, None)
 
     def _syn(self, p, addr):
+        # If a connection already exists for this addr (3DS reconnecting from the
+        # same NAT source port), drop the old one cleanly so its ping/retransmit
+        # loops stop and don't interfere with the new session.
+        old = self.conns.pop(addr, None)
+        if old is not None:
+            old.pending.clear()
+            log.debug("[%s] SYN replacing existing connection from %s", self.mode, addr)
+
         conn = Connection(addr)
         conn.client_vport    = p.src
         conn.server_vport    = p.dst
@@ -295,22 +308,19 @@ class PRUDPServer:
         log.warning("[%s] DATA seq=%d unacknowledged", self.mode, seq)
 
     async def _ping_loop(self, addr, conn):
-        await asyncio.sleep(PING_INTERVAL)
+        # nex-go is PASSIVE: the server never sends its own PING packets to the
+        # 3DS (SendPing is commented out in the reference server). It only ACKs
+        # the client's pings and tears the connection down if the client goes
+        # silent. Sending unsolicited server pings disrupts the game at sensitive
+        # moments (e.g. right after the maintenance response), causing the flaky
+        # "stuck on Connecting" stall. So here we ONLY watch for timeout.
         while addr in self.conns and self.conns[addr] is conn:
-            if time.monotonic() - conn.last_ack > PING_TIMEOUT:
-                log.info("[%s] timeout pid=%d %s", self.mode, conn.pid, addr)
-                self.conns.pop(addr, None)
-                return
-            seq          = conn.ping_seq
-            conn.ping_seq = (conn.ping_seq + 1) & 0xFFFF
-            ping         = pkt.Packet(ptype=pkt.TYPE_PING,
-                                       flags=pkt.FLAG_RELIABLE | pkt.FLAG_NEED_ACK)
-            ping.src     = conn.server_vport
-            ping.dst     = conn.client_vport
-            ping.session_id = conn.session_id
-            ping.seq_id  = seq
-            self._raw_send(conn, ping)
             await asyncio.sleep(PING_INTERVAL)
+            if time.monotonic() - conn.last_ack > CONNECTION_IDLE_TIMEOUT:
+                log.info("[%s] idle timeout pid=%d %s", self.mode, conn.pid, addr)
+                self.conns.pop(addr, None)
+                conn.pending.clear()
+                return
 
 
 class _Protocol(asyncio.DatagramProtocol):

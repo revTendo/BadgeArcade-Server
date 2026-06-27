@@ -174,6 +174,25 @@ def get_free_play_data_by_owner(owner_id: int) -> Optional[dict]:
         }
 
 
+def get_free_play_data_by_data_id(data_id: int) -> Optional[dict]:
+    with _conn() as conn:
+        row = conn.execute(
+            "SELECT data_id,meta_binary,created_time,updated_time,period,flag,referred_time "
+            "FROM free_play_data WHERE data_id=?", (data_id,)
+        ).fetchone()
+        if not row:
+            return None
+        return {
+            "data_id":       int(row[0]),
+            "meta_binary":   bytes(row[1]) if row[1] else b"",
+            "created_time":  int(row[2]),
+            "updated_time":  int(row[3]),
+            "period":        int(row[4]),
+            "flag":          int(row[5]),
+            "referred_time": int(row[6]),
+        }
+
+
 def insert_free_play_data(data_id, owner_id, meta_binary, created_time, period, flag):
     with _write_lock, _conn() as conn:
         conn.execute(

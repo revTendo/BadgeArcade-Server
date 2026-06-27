@@ -81,8 +81,10 @@ async def _register(method: int, call_id: int, params: bytes,
 
 
 def _maintenance(call_id: int) -> bytes:
+    # Matches the working Go server exactly:
+    #   maintenanceStatus = 0xFFFF, maintenanceTime = 0, isSuccess = true
     out = StreamOut()
-    out.u16(0x0000)
+    out.u16(0xFFFF)
     out.u32(0)
     out.bool(True)
     return encode_success(PROTO_SECURE, M_MAINTENANCE, call_id, out.get())
@@ -135,9 +137,14 @@ async def _ds_dispatch(method, call_id, params, pid):
         flag        = inp.u32() if inp.remaining() >= 4 else 0
         now         = int(time.time())
         data_id     = (now * 1000) & 0xFFFFFFFF
-        log.info("[DS] PostMetaBinary pid=%d slot=%d", pid, slot)
+        log.info("[DS] PostMetaBinary pid=%d slot=%d bytes=%d", pid, slot, len(meta_binary))
         await _run(db.insert_free_play_data, data_id, pid, meta_binary, now, period, flag)
         await _run(db.insert_user_play_info, data_id, pid, slot)
+        # Persist the blob to the file server at version 1 AND mark the version,
+        # so a later PrepareGetObject/GET serves the file instead of 404ing.
+        key = s3_store.data_key(data_id, 1)
+        await _run(s3_store.write_object, key, meta_binary)
+        await _run(db.update_play_info_version, data_id, 1)
         out = StreamOut(); out.u64(data_id)
         return encode_success(PROTO_DS, method, call_id, out.get())
 
@@ -152,10 +159,14 @@ async def _ds_dispatch(method, call_id, params, pid):
         log.info("[DS] PreparePostObject pid=%d size=%d", pid, size)
         await _run(db.insert_free_play_data, data_id, pid, b"", now, period, flag)
         await _run(db.insert_user_play_info, data_id, pid, slot)
-        key = s3_store.data_key(data_id, 0)
+        key = s3_store.data_key(data_id, 1)
+        form_fields = [
+            ("key", key),
+            ("acl", "private"),
+            ("signature", "signature"),
+        ]
         out = StreamOut()
-        write_req_post_info(out, data_id, s3_store.object_url(key),
-                             "x-amz-acl=public-read&Content-Type=application/octet-stream")
+        write_req_post_info(out, data_id, s3_store.object_url(""), form_fields)
         return encode_success(PROTO_DS, method, call_id, out.get())
 
     elif method == M_COMPLETE_POST:
@@ -165,6 +176,9 @@ async def _ds_dispatch(method, call_id, params, pid):
         log.info("[DS] CompletePostObject pid=%d data_id=%d ok=%s", pid, data_id, is_success)
         if not is_success:
             return encode_error(PROTO_DS, method, call_id, 0x80380104)
+        # On success, bump the version to 1 so PrepareGetObject builds the right
+        # key (00...-00001). The Go server does updateUserPlayInfoVersion here.
+        await _run(db.update_play_info_version, data_id, 1)
         return encode_success(PROTO_DS, method, call_id, b"")
 
     elif method == M_PREPARE_GET:
@@ -172,13 +186,24 @@ async def _ds_dispatch(method, call_id, params, pid):
         data_id = inp.u64()
         log.info("[DS] PrepareGetObject pid=%d data_id=%d", pid, data_id)
         version = await _run(db.get_version_by_data_id, data_id)
-        key     = s3_store.data_key(data_id, version)
-        size    = s3_store.object_size(key)
-        out     = StreamOut()
+        if version == 0:
+            version = 1
+        key = s3_store.data_key(data_id, version)
+        # Backfill: if the file isn't on disk yet (e.g. saved via PostMetaBinary
+        # before we wrote blobs to the file server), recreate it from the DB.
+        if s3_store.object_size(key) == 0:
+            row = await _run(db.get_free_play_data_by_data_id, data_id)
+            if row and row.get("meta_binary"):
+                await _run(s3_store.write_object, key, row["meta_binary"])
+        size = s3_store.object_size(key)
+        out  = StreamOut()
         write_req_get_info(out, s3_store.object_url(key), size, data_id)
         return encode_success(PROTO_DS, method, call_id, out.get())
 
     elif method == M_GET_META_BY_OWNER:
+        # DataStoreGetMetaByOwnerIDParam is a structure (has a header), then:
+        #   OwnerIDs List[PID], DataTypes List[UInt16], ResultOption u8, ResultRange
+        _skip_struct(inp)
         owner_ids    = inp.list_pid()
         _data_types  = inp.list_u16()
         _result_opt  = inp.u8()
@@ -190,9 +215,10 @@ async def _ds_dispatch(method, call_id, params, pid):
             if row:
                 results.append((oid, row))
         out = StreamOut()
-        out.u32(len(results))
+        out.u32(len(results))               # List<DataStoreMetaInfo>
         for oid, row in results:
             write_meta_info(out, row, oid)
+        out.bool(False)                     # pHasNext
         return encode_success(PROTO_DS, method, call_id, out.get())
 
     elif method == M_CHANGE_META:
@@ -236,9 +262,16 @@ async def _ds_dispatch(method, call_id, params, pid):
 
 
 def _skip_struct(inp: StreamIn):
-    # 3DS Badge Arcade does NOT use structure headers, so there is nothing
-    # to skip. Kept as a no-op so call sites stay readable.
-    return
+    # When structure headers are enabled (3DS NEX >= 30500), each structure
+    # parameter is prefixed with u8 version + u32 length. Consume it so the
+    # fields that follow line up.
+    from nex.types import USE_STRUCT_HEADER
+    if not USE_STRUCT_HEADER:
+        return
+    if inp.remaining() < 5:
+        return
+    _version = inp.u8()
+    _length  = inp.u32()
 
 
 # ── Shop Badge Arcade (0xC8) ──────────────────────────────────────────────────

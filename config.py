@@ -32,8 +32,12 @@ def mongo_uri():           return _require("MONGO_URI")
 
 def sqlite_path():         return os.getenv("SQLITE_PATH", "badge_arcade.db")
 def storage_path():        return os.getenv("STORAGE_PATH", "datastore_files")
-def file_server_port():    return int(os.getenv("FILE_SERVER_PORT", "8080"))
+def file_server_port():    return int(os.getenv("FILE_SERVER_PORT", "8087"))
 
-PRUDP_RESEND_LIMIT = 3
+def file_server_host():
+
+    return os.getenv("FILE_SERVER_HOST") or secure_server_location()
+
+PRUDP_RESEND_LIMIT = 8
 PRUDP_SUPPORTED_FUNCTIONS = 0
 PRUDP_MAX_SUBSTREAM_ID    = 0

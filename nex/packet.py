@@ -21,7 +21,6 @@ OPT_FRAGMENT   = 2
 OPT_INIT_UNRELIABLE = 3
 OPT_MAX_SUBSTREAM   = 4
 
-
 @dataclass
 class Packet:
     ptype:       int   = 0
@@ -42,7 +41,6 @@ class Packet:
 
     def has_flag(self, f: int) -> bool:
         return bool(self.flags & f)
-
 
 def decode(data: bytes) -> list:
     packets = []
@@ -90,7 +88,6 @@ def decode(data: bytes) -> list:
         packets.append(pkt)
     return packets
 
-
 def _decode_options(pkt: Packet, data: bytes):
     pos = 0
     while pos < len(data):
@@ -114,7 +111,6 @@ def _decode_options(pkt: Packet, data: bytes):
             if opt_id == OPT_FRAGMENT and len(val) == 1:
                 pkt.fragment_id = val[0]
 
-
 def _encode_options(pkt: Packet) -> bytes:
     buf = bytearray()
     if pkt.ptype in (TYPE_SYN, TYPE_CONNECT):
@@ -130,11 +126,10 @@ def _encode_options(pkt: Packet) -> bytes:
         buf += bytes([OPT_FRAGMENT, 1, pkt.fragment_id])
     return bytes(buf)
 
-
 def _encode_header(pkt: Packet, opts_len: int, payload_len: int) -> bytes:
     type_flags = pkt.ptype | (pkt.flags << 4)
     return struct.pack('<BBHBBHBBH',
-        1,                # version
+        1,
         opts_len,
         payload_len,
         pkt.src,
@@ -144,7 +139,6 @@ def _encode_header(pkt: Packet, opts_len: int, payload_len: int) -> bytes:
         pkt.substream_id,
         pkt.seq_id,
     )
-
 
 def encode(pkt: Packet, access_key: str, session_key: bytes,
            conn_sig: bytes) -> bytes:
@@ -163,7 +157,6 @@ def encode(pkt: Packet, access_key: str, session_key: bytes,
     buf += options
     buf += pkt.payload
     return bytes(buf)
-
 
 def make_ack(req: Packet) -> Packet:
     ack = Packet(

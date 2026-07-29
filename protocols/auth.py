@@ -18,17 +18,14 @@ METHOD_REQ_TICKET = 3
 
 SERVER_PID        = 2
 
-
 def _server_key():
     return derive_kerberos_key(SERVER_PID, config.kerberos_password().encode())
-
 
 def _make_ticket(user_pid: int, user_password: str) -> bytes:
     session_key  = secrets.token_bytes(config.KERBEROS_KEY_SIZE)
     srv_ticket   = build_server_ticket(session_key, user_pid, _server_key())
     user_key     = derive_kerberos_key(user_pid, user_password.encode())
     return build_client_ticket(session_key, SERVER_PID, srv_ticket, user_key)
-
 
 def _login_response(method: int, call_id: int, account: dict) -> bytes:
     pid      = account['pid']
@@ -50,10 +47,8 @@ def _login_response(method: int, call_id: int, account: dict) -> bytes:
     log.info("[Auth] Ticket issued pid=%d", pid)
     return encode_success(PROTOCOL_ID, method, call_id, out.get())
 
-
 def _error_response(call_id: int, method: int) -> bytes:
     return encode_error(PROTOCOL_ID, method, call_id, 0x80150001)
-
 
 async def handle(method: int, call_id: int, params: bytes) -> bytes:
     inp = StreamIn(params)
@@ -81,7 +76,7 @@ async def handle(method: int, call_id: int, params: bytes) -> bytes:
             lambda: db.get_nex_account_by_pid(source)
         )
         if account is None:
-            # Auto-create: the 3DS username is the PID as a string.
+
             account = await anyio.to_thread.run_sync(
                 lambda: db.create_nex_account(source, str(source))
             )

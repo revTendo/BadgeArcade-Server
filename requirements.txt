@@ -2,3 +2,7 @@ pycryptodome>=3.18.0
 pymongo>=4.6.0
 python-dotenv>=1.0.0
 anyio>=4.3.0
+flask
+xmltodict
+requests
+python-dotenv

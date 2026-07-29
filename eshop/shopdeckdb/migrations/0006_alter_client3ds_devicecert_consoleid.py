@@ -1,0 +1,17 @@
+
+
+from django.db import migrations, models
+
+class Migration(migrations.Migration):
+
+    dependencies = [
+        ('shopdeckdb', '0005_rename_devicecert_consoldeid_client3ds_devicecert_consoleid'),
+    ]
+
+    operations = [
+        migrations.AlterField(
+            model_name='client3ds',
+            name='devicecert_consoleid',
+            field=models.CharField(blank=True, max_length=8, null=True),
+        ),
+    ]

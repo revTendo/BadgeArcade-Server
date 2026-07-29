@@ -1,0 +1,26 @@
+
+
+from django.db import migrations, models
+
+class Migration(migrations.Migration):
+
+    dependencies = [
+        ('shopdeckdb', '0002_ownedtitle_version'),
+    ]
+
+    operations = [
+        migrations.RemoveField(
+            model_name='title',
+            name='ticket',
+        ),
+        migrations.RemoveField(
+            model_name='title',
+            name='ticket_id',
+        ),
+        migrations.AddField(
+            model_name='ownedtitle',
+            name='ticketid',
+            field=models.CharField(default='a', max_length=16),
+            preserve_default=False,
+        ),
+    ]

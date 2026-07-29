@@ -13,14 +13,12 @@ import config
 log = logging.getLogger(__name__)
 
 PING_INTERVAL = 5.0
-# The 3DS goes silent for long stretches (e.g. the ~2 min catalog download),
-# so the idle timeout must be generous — only tear down truly dead connections.
+
 CONNECTION_IDLE_TIMEOUT = 300.0
 CD_ML         = b'CD&ML'
 
 TYPE_NAMES = ['SYN','CONNECT','DATA','DISCONNECT','PING','USER','ROUTE','RAW']
 pkt.TYPE_NAMES = TYPE_NAMES
-
 
 class Connection:
     STATE_INIT      = 0
@@ -29,12 +27,13 @@ class Connection:
     def __init__(self, addr):
         self.addr            = addr
         self.session_id      = secrets.randbits(8)
-        self.data_seq        = 1   # reliable server→client DATA counter (starts at 1)
-        self.ping_seq        = 1   # separate PING counter (starts at 1)
+        self.data_seq        = 1
+        self.ping_seq        = 1
         self.pid             = 0
         self.session_key     = b''
         self.rc4             = None
         self.pending         = {}
+        self.seen_data_seqs  = set()
         self.last_ack        = time.monotonic()
         self.client_conn_sig = bytes(16)
         self.client_vport    = 0xA1
@@ -42,13 +41,12 @@ class Connection:
         self.state           = self.STATE_INIT
         self.minor_version   = 0
 
-
 class PRUDPServer:
     def __init__(self, port, mode, dispatch_fn, server_key=None):
         self.port       = port
         self.mode       = mode
         self.dispatch   = dispatch_fn
-        self.server_key = server_key   # None = auth server
+        self.server_key = server_key
         self.conns      = {}
         self.transport  = None
 
@@ -87,8 +85,23 @@ class PRUDPServer:
 
     def _route(self, p, addr):
         conn = self.conns.get(addr)
+
+        if conn is None and p.ptype not in (pkt.TYPE_SYN, pkt.TYPE_CONNECT):
+            sid = getattr(p, "session_id", 0)
+            if sid:
+                for old_addr, c in list(self.conns.items()):
+                    if c.session_id == sid and old_addr[0] == addr[0]:
+
+                        log.info("[%s] session %d moved %s -> %s (NAT remap)",
+                                 self.mode, sid, old_addr, addr)
+                        self.conns.pop(old_addr, None)
+                        c.addr = addr
+                        self.conns[addr] = c
+                        conn = c
+                        break
+
         if conn is not None:
-            conn.last_ack = time.monotonic()   # any packet means the client is alive
+            conn.last_ack = time.monotonic()
 
         if p.has_flag(pkt.FLAG_MULTI_ACK):
             if conn:
@@ -99,7 +112,7 @@ class PRUDPServer:
         if p.has_flag(pkt.FLAG_ACK):
             if conn:
                 conn.last_ack = time.monotonic()
-                # Normal ACK echoes the type and seq of the packet being acked
+
                 conn.pending.pop((p.ptype, p.seq_id), None)
             return
 
@@ -115,7 +128,7 @@ class PRUDPServer:
         elif p.ptype == pkt.TYPE_DATA and conn and conn.state == Connection.STATE_CONNECTED:
             self._data(p, addr, conn)
         elif p.ptype == pkt.TYPE_PING and conn:
-            conn.last_ack = time.monotonic()   # client is alive
+            conn.last_ack = time.monotonic()
             self._ack(conn, p)
         elif p.ptype == pkt.TYPE_DISCONNECT and conn:
             if p.has_flag(pkt.FLAG_NEED_ACK):
@@ -124,9 +137,7 @@ class PRUDPServer:
             log.info("[%s] DISCONNECT pid=%d", self.mode, conn.pid)
 
     def _handle_aggregate_ack(self, p, conn):
-        # MULTI_ACK / aggregate ack: acknowledges every reliable DATA packet
-        # up to and including a base sequence id. PRUDPv1 "new" form is keyed
-        # by substream_id == 1: payload = substream(1) + count(1) + base(u16) + extra[].
+
         payload = p.payload
         try:
             if p.substream_id == 1 and len(payload) >= 4:
@@ -139,16 +150,13 @@ class PRUDPServer:
         except Exception:
             base_id, extra = p.seq_id, ()
 
-        # Clear every pending DATA with seq <= base_id, plus any explicit extras
         for key in list(conn.pending):
             ktype, kseq = key
             if ktype == pkt.TYPE_DATA and (kseq <= base_id or kseq in extra):
                 conn.pending.pop(key, None)
 
     def _syn(self, p, addr):
-        # If a connection already exists for this addr (3DS reconnecting from the
-        # same NAT source port), drop the old one cleanly so its ping/retransmit
-        # loops stop and don't interfere with the new session.
+
         old = self.conns.pop(addr, None)
         if old is not None:
             old.pending.clear()
@@ -167,12 +175,11 @@ class PRUDPServer:
         ack.dst                 = conn.client_vport
         ack.session_id          = 0
         ack.conn_sig            = conn.server_conn_sig
-        # Negotiate: server advertises supported_functions=0, so the AND is 0.
+
         ack.minor_version       = conn.minor_version
         ack.supported_functions = config.PRUDP_SUPPORTED_FUNCTIONS & p.supported_functions
         ack.max_substream_id    = min(config.PRUDP_MAX_SUBSTREAM_ID, p.max_substream_id)
 
-        # SYN-ACK signature uses EMPTY session key AND EMPTY connection signature
         raw = pkt.encode(ack, config.ACCESS_KEY, b'', b'')
         self.transport.sendto(raw, addr)
         log.debug("[%s] SYN-ACK → %s minor=%d funcs=%d max_sub=%d",
@@ -183,8 +190,6 @@ class PRUDPServer:
         conn.client_conn_sig = p.conn_sig
         conn.client_vport    = p.src
         conn.server_vport    = p.dst
-        # conn.session_id keeps the server's own random ID (set in __init__),
-        # exactly like kinnay's client.local_session_id.
 
         log.debug("[%s] CONNECT recv: payload=%d bytes client_sig=%s minor=%d",
                   self.mode, len(p.payload), p.conn_sig.hex()[:12], p.minor_version)
@@ -192,13 +197,13 @@ class PRUDPServer:
         ack_payload = b''
 
         if self.server_key is None:
-            # Auth server: encrypt DATA with CD&ML, no ticket
+
             conn.rc4 = RC4Stream(CD_ML)
             conn.state = Connection.STATE_CONNECTED
             log.info("[%s] CONNECT from %s", self.mode, addr)
 
         else:
-            # Secure server: parse kerberos ticket
+
             if not p.payload:
                 log.error("[%s] CONNECT from %s: empty payload", self.mode, addr)
                 self.conns.pop(addr, None)
@@ -255,6 +260,16 @@ class PRUDPServer:
         if not p.payload:
             return
 
+        seq = p.seq_id
+        if seq in conn.seen_data_seqs:
+            log.debug("[%s] duplicate DATA seq=%d ignored (already processed)",
+                      self.mode, seq)
+            return
+        conn.seen_data_seqs.add(seq)
+
+        if len(conn.seen_data_seqs) > 256:
+            conn.seen_data_seqs = set(sorted(conn.seen_data_seqs)[-128:])
+
         raw = conn.rc4.decrypt(p.payload) if conn.rc4 else p.payload
 
         try:
@@ -297,31 +312,27 @@ class PRUDPServer:
         self.transport.sendto(raw, conn.addr)
         conn.pending[key] = raw
 
+        delay = 0.4
         for _ in range(config.PRUDP_RESEND_LIMIT):
-            await asyncio.sleep(1.5)
+            await asyncio.sleep(delay)
             if key not in conn.pending:
                 return
-            log.debug("[%s] resend DATA seq=%d", self.mode, seq)
+            log.debug("[%s] resend DATA seq=%d -> %s", self.mode, seq, conn.addr)
             self.transport.sendto(raw, conn.addr)
+            delay = min(delay * 1.5, 2.0)
 
         conn.pending.pop(key, None)
         log.warning("[%s] DATA seq=%d unacknowledged", self.mode, seq)
 
     async def _ping_loop(self, addr, conn):
-        # nex-go is PASSIVE: the server never sends its own PING packets to the
-        # 3DS (SendPing is commented out in the reference server). It only ACKs
-        # the client's pings and tears the connection down if the client goes
-        # silent. Sending unsolicited server pings disrupts the game at sensitive
-        # moments (e.g. right after the maintenance response), causing the flaky
-        # "stuck on Connecting" stall. So here we ONLY watch for timeout.
-        while addr in self.conns and self.conns[addr] is conn:
+
+        while conn.addr in self.conns and self.conns[conn.addr] is conn:
             await asyncio.sleep(PING_INTERVAL)
             if time.monotonic() - conn.last_ack > CONNECTION_IDLE_TIMEOUT:
-                log.info("[%s] idle timeout pid=%d %s", self.mode, conn.pid, addr)
-                self.conns.pop(addr, None)
+                log.info("[%s] idle timeout pid=%d %s", self.mode, conn.pid, conn.addr)
+                self.conns.pop(conn.addr, None)
                 conn.pending.clear()
                 return
-
 
 class _Protocol(asyncio.DatagramProtocol):
     def __init__(self, server):

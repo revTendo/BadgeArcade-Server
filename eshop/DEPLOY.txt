@@ -1,0 +1,25 @@
+Multiple Genres feature - deploy over /root/nex_server/eshop/
+
+Files (same relative paths as this zip):
+  shopdeckdb/models.py                        (genre -> ManyToManyField)
+  shopdeckdb/admin.py                         (genre -> filter_horizontal)
+  shopdeckdb/migrations/0014_title_genre_m2m.py  (data-preserving FK->M2M migration)
+  metadata/views.py                           (genres[] array, first-genre display, .distinct())
+  api/views.py                                (wishlist genre refs -> first-genre)
+
+Deploy:
+  cd /root/nex_server/eshop
+  mysqldump --single-transaction eshop shopdeckdb_title > ~/title_backup_$(date +%s).sql
+  # back up the 4 existing files (models.py, admin.py, metadata/views.py, api/views.py)
+  # copy these files into place (preserving the paths above)
+  python3 manage.py migrate shopdeckdb 0014
+  systemctl restart nex-server
+
+Verify no data lost:
+  mysql eshop -e "SELECT t.name, g.name FROM shopdeckdb_title t \
+    JOIN shopdeckdb_title_genre tg ON tg.title_id=t.id \
+    JOIN shopdeckdb_genre g ON g.id=tg.genre_id ORDER BY t.id;"
+
+Rollback:
+  python3 manage.py migrate shopdeckdb 0013   (keeps first genre only)
+  restore the .bak files, then: systemctl restart nex-server

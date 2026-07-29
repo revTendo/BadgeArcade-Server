@@ -3,14 +3,12 @@ import struct
 SUCCESS   = 0x00010001
 ERROR_MASK = 0x80000000
 
-
 class RMCRequest:
     def __init__(self, protocol: int, method: int, call_id: int, params: bytes):
         self.protocol = protocol
         self.method   = method
         self.call_id  = call_id
         self.params   = params
-
 
 def decode_request(data: bytes) -> RMCRequest:
     if len(data) < 4:
@@ -35,7 +33,6 @@ def decode_request(data: bytes) -> RMCRequest:
 
     return RMCRequest(protocol, method, call_id, params)
 
-
 def encode_success(protocol: int, method: int, call_id: int, params: bytes) -> bytes:
     buf = bytearray()
     if protocol < 0x80:
@@ -43,12 +40,11 @@ def encode_success(protocol: int, method: int, call_id: int, params: bytes) -> b
     else:
         buf.append(0x7F)
         buf.extend(struct.pack('<H', protocol))
-    buf.append(1)                                     # success = True
+    buf.append(1)
     buf.extend(struct.pack('<I', call_id))
     buf.extend(struct.pack('<I', method | 0x8000))
     buf.extend(params)
     return _wrap(buf)
-
 
 def encode_error(protocol: int, method: int, call_id: int, error_code: int) -> bytes:
     if not (error_code & ERROR_MASK):
@@ -59,11 +55,10 @@ def encode_error(protocol: int, method: int, call_id: int, error_code: int) -> b
     else:
         buf.append(0x7F)
         buf.extend(struct.pack('<H', protocol))
-    buf.append(0)                                     # success = False
+    buf.append(0)
     buf.extend(struct.pack('<I', error_code))
     buf.extend(struct.pack('<I', call_id))
     return _wrap(buf)
-
 
 def _wrap(body: bytearray) -> bytes:
     return struct.pack('<I', len(body)) + bytes(body)

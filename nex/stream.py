@@ -1,6 +1,5 @@
 import struct
 
-
 class StreamIn:
     def __init__(self, data: bytes):
         self._data = data
@@ -55,7 +54,6 @@ class StreamIn:
     def result_range(self) -> tuple:
         return self.u32(), self.u32()
 
-
 class StreamOut:
     def __init__(self):
         self._buf = bytearray()
@@ -75,8 +73,7 @@ class StreamOut:
     def pid(self, v: int): self.u32(v)
 
     def string(self, s: str):
-        # Matches nex-go WriteString: always append a null terminator,
-        # so an empty string is encoded as u16(1) + 0x00 (NOT u16(0)).
+
         raw = (s + '\x00').encode('utf-8')
         self.u16(len(raw))
         self.write(raw)

@@ -1,0 +1,23 @@
+{% extends '_layout.html' %}
+{% block main %}
+<h1>News</h1>
+{% if messages %}
+{% for message in messages %}
+<div class="alert alert-info">{{ message.content }}</div>
+{% endfor %}
+{% endif %}
+{% if announcements %}
+{% for announcement in announcements %}
+<div class="card bg-dark news-card">
+    {% if announcement.is_banner and announcement.banner_url %}<img src="{{ announcement.banner_url }}" class="card-img-top" alt="Banner">{% endif %}
+    <div class="card-body">
+        <h4 class="card-title">{{ announcement.title }}</h4>
+        <p class="card-text">{{ announcement.content }}</p>
+        <small class="text-white-50">{{ announcement.date }}</small>
+    </div>
+</div>
+{% endfor %}
+{% else %}
+<h4>Nothing to report right now. Check back later!</h4>
+{% endif %}
+{% endblock %}

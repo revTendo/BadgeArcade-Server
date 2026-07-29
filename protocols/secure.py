@@ -1,3 +1,4 @@
+from nex.crypto import make_datetime_now
 import logging
 import time
 
@@ -13,18 +14,13 @@ log = logging.getLogger(__name__)
 
 import anyio
 
-
 async def _run(fn, *args):
     return await anyio.to_thread.run_sync(lambda: fn(*args))
-
-
-# ── SecureConnection (0x0B) ───────────────────────────────────────────────────
 
 PROTO_SECURE    = 0x0B
 M_REGISTER      = 0x1
 M_REGISTER_EX   = 0x4
 M_MAINTENANCE   = 0x9
-
 
 async def handle_secure(method: int, call_id: int, params: bytes,
                          pid: int, client_addr: tuple) -> bytes:
@@ -35,7 +31,6 @@ async def handle_secure(method: int, call_id: int, params: bytes,
     else:
         log.warning("[Secure] Unknown method 0x%X", method)
         return encode_error(PROTO_SECURE, method, call_id, 0x80010002)
-
 
 async def _register(method: int, call_id: int, params: bytes,
                      pid: int, client_addr: tuple) -> bytes:
@@ -75,22 +70,16 @@ async def _register(method: int, call_id: int, params: bytes,
 
     out = StreamOut()
     out.result(SUCCESS)
-    out.u32(pid)          # connection ID = PID
+    out.u32(pid)
     out.string(public_url)
     return encode_success(PROTO_SECURE, method, call_id, out.get())
 
-
 def _maintenance(call_id: int) -> bytes:
-    # Matches the working Go server exactly:
-    #   maintenanceStatus = 0xFFFF, maintenanceTime = 0, isSuccess = true
     out = StreamOut()
     out.u16(0xFFFF)
     out.u32(0)
     out.bool(True)
     return encode_success(PROTO_SECURE, M_MAINTENANCE, call_id, out.get())
-
-
-# ── DataStore (0x73) ──────────────────────────────────────────────────────────
 
 PROTO_DS            = 0x73
 M_PREPARE_GET       = 25
@@ -103,6 +92,53 @@ M_GET_PERSISTENCE   = 29
 M_CHANGE_META       = 38
 M_GET_META_BY_OWNER = 0x2D
 
+def _skip_struct(inp: StreamIn):
+    from nex.types import USE_STRUCT_HEADER
+    if not USE_STRUCT_HEADER:
+        return
+    if inp.remaining() < 5:
+        return
+    _version = inp.u8()
+    _length  = inp.u32()
+
+class DataStorePreparePostParam:
+    def __init__(self, inp: StreamIn):
+        _skip_struct(inp)
+        self.size        = inp.u32()
+        self.name        = inp.string()
+        self.data_type   = inp.u16()
+        self.meta_binary = inp.qbuffer()
+
+        _skip_struct(inp)
+        inp.u8(); inp.list_pid()
+        _skip_struct(inp)
+        inp.u8(); inp.list_pid()
+
+        self.flag   = inp.u32()
+        self.period = inp.u16()
+
+class DataStorePrepareUpdateParam:
+    def __init__(self, inp: StreamIn):
+        _skip_struct(inp)
+        self.data_id         = inp.u64()
+        self.update_password = inp.u64()
+        self.size            = inp.u32()
+        self.modifies_flag   = inp.u32()
+
+class DataStoreChangeMetaParam:
+    def __init__(self, inp: StreamIn):
+        _skip_struct(inp)
+        self.data_id       = inp.u64()
+        self.modifies_flag = inp.u32()
+        self.name          = inp.string()
+
+        _skip_struct(inp)
+        inp.u8(); inp.list_pid()
+        _skip_struct(inp)
+        inp.u8(); inp.list_pid()
+
+        self.period      = inp.u16()
+        self.meta_binary = inp.qbuffer()
 
 async def handle_datastore(method: int, call_id: int,
                             params: bytes, pid: int) -> bytes:
@@ -111,7 +147,6 @@ async def handle_datastore(method: int, call_id: int,
     except Exception:
         log.exception("[DS] method=0x%X pid=%d", method, pid)
         return encode_error(PROTO_DS, method, call_id, 0x80010002)
-
 
 async def _ds_dispatch(method, call_id, params, pid):
     inp = StreamIn(params)
@@ -122,51 +157,43 @@ async def _ds_dispatch(method, call_id, params, pid):
         log.info("[DS] GetPersistenceInfo pid=%d owner=%d slot=%d", pid, owner_id, slot)
         data_id  = await _run(db.get_persistence_info, owner_id, slot)
         if data_id == 0:
-            # No data for this owner/slot → DataStore::NotFound (matches Go server)
             return encode_error(PROTO_DS, method, call_id, 0x80690004)
         out = StreamOut()
         write_persistence_info(out, owner_id, slot, 0, data_id)
         return encode_success(PROTO_DS, method, call_id, out.get())
 
     elif method == M_POST_META_BINARY:
-        # Skip PreparePostParam structure header if present
-        _skip_struct(inp)
-        slot        = inp.u16() if inp.remaining() >= 2 else 0
-        period      = inp.u16() if inp.remaining() >= 2 else 0
-        meta_binary = inp.qbuffer() if inp.remaining() > 2 else b""
-        flag        = inp.u32() if inp.remaining() >= 4 else 0
-        now         = int(time.time())
-        data_id     = (now * 1000) & 0xFFFFFFFF
-        log.info("[DS] PostMetaBinary pid=%d slot=%d bytes=%d", pid, slot, len(meta_binary))
-        await _run(db.insert_free_play_data, data_id, pid, meta_binary, now, period, flag)
-        await _run(db.insert_user_play_info, data_id, pid, slot)
-        # Persist the blob to the file server at version 1 AND mark the version,
-        # so a later PrepareGetObject/GET serves the file instead of 404ing.
-        key = s3_store.data_key(data_id, 1)
-        await _run(s3_store.write_object, key, meta_binary)
-        await _run(db.update_play_info_version, data_id, 1)
-        out = StreamOut(); out.u64(data_id)
+        param = DataStorePreparePostParam(inp)
+        log.info("[DS] PostMetaBinary pid=%d dtype=%d meta_bytes=%d", pid, param.data_type, len(param.meta_binary))
+
+        if param.data_type == 100:
+            slot = 0
+            data_id = await _run(db.save_free_play_data, pid, slot, param.meta_binary, param.period, param.flag)
+
+        out = StreamOut()
+        out.u64(pid)
         return encode_success(PROTO_DS, method, call_id, out.get())
 
     elif method == M_PREPARE_POST:
-        _skip_struct(inp)
-        size    = inp.u32() if inp.remaining() >= 4 else 0
-        slot    = inp.u16() if inp.remaining() >= 2 else 0
-        period  = inp.u16() if inp.remaining() >= 2 else 0
-        flag    = inp.u32() if inp.remaining() >= 4 else 0
-        now     = int(time.time())
-        data_id = (now * 1000) & 0xFFFFFFFF
-        log.info("[DS] PreparePostObject pid=%d size=%d", pid, size)
-        await _run(db.insert_free_play_data, data_id, pid, b"", now, period, flag)
-        await _run(db.insert_user_play_info, data_id, pid, slot)
+        param = DataStorePreparePostParam(inp)
+        log.info("[DS] PreparePostObject pid=%d size=%d dtype=%d", pid, param.size, param.data_type)
+
+        slot = 0
+        data_id = await _run(db.get_data_id_for_owner_slot, pid, slot)
+        if data_id is None:
+
+            data_id = await _run(db.save_free_play_data, pid, slot, b"", param.period, param.flag)
+
         key = s3_store.data_key(data_id, 1)
         form_fields = [
             ("key", key),
             ("acl", "private"),
             ("signature", "signature"),
         ]
+        upload_url = s3_store.object_url("")
+        log.info("[DS] PreparePostObject -> upload_url=%s key=%s", upload_url, key)
         out = StreamOut()
-        write_req_post_info(out, data_id, s3_store.object_url(""), form_fields)
+        write_req_post_info(out, data_id, upload_url, form_fields)
         return encode_success(PROTO_DS, method, call_id, out.get())
 
     elif method == M_COMPLETE_POST:
@@ -176,8 +203,6 @@ async def _ds_dispatch(method, call_id, params, pid):
         log.info("[DS] CompletePostObject pid=%d data_id=%d ok=%s", pid, data_id, is_success)
         if not is_success:
             return encode_error(PROTO_DS, method, call_id, 0x80380104)
-        # On success, bump the version to 1 so PrepareGetObject builds the right
-        # key (00...-00001). The Go server does updateUserPlayInfoVersion here.
         await _run(db.update_play_info_version, data_id, 1)
         return encode_success(PROTO_DS, method, call_id, b"")
 
@@ -188,21 +213,17 @@ async def _ds_dispatch(method, call_id, params, pid):
         version = await _run(db.get_version_by_data_id, data_id)
         if version == 0:
             version = 1
-        key = s3_store.data_key(data_id, version)
-        # Backfill: if the file isn't on disk yet (e.g. saved via PostMetaBinary
-        # before we wrote blobs to the file server), recreate it from the DB.
-        if s3_store.object_size(key) == 0:
-            row = await _run(db.get_free_play_data_by_data_id, data_id)
-            if row and row.get("meta_binary"):
-                await _run(s3_store.write_object, key, row["meta_binary"])
+        key  = s3_store.data_key(data_id, version)
         size = s3_store.object_size(key)
+        if size == 0:
+            log.warning("[DS] PrepareGetObject: no save file on disk for %s", key)
+        dl_url = s3_store.object_url(key)
+        log.info("[DS] PrepareGetObject -> download_url=%s size=%d", dl_url, size)
         out  = StreamOut()
-        write_req_get_info(out, s3_store.object_url(key), size, data_id)
+        write_req_get_info(out, dl_url, size, data_id)
         return encode_success(PROTO_DS, method, call_id, out.get())
 
     elif method == M_GET_META_BY_OWNER:
-        # DataStoreGetMetaByOwnerIDParam is a structure (has a header), then:
-        #   OwnerIDs List[PID], DataTypes List[UInt16], ResultOption u8, ResultRange
         _skip_struct(inp)
         owner_ids    = inp.list_pid()
         _data_types  = inp.list_u16()
@@ -215,33 +236,36 @@ async def _ds_dispatch(method, call_id, params, pid):
             if row:
                 results.append((oid, row))
         out = StreamOut()
-        out.u32(len(results))               # List<DataStoreMetaInfo>
+        out.u32(len(results))
         for oid, row in results:
             write_meta_info(out, row, oid)
-        out.bool(False)                     # pHasNext
+        out.bool(False)
         return encode_success(PROTO_DS, method, call_id, out.get())
 
     elif method == M_CHANGE_META:
-        _skip_struct(inp)
-        data_id       = inp.u64()
-        modifies_flag = inp.u32()
+        param = DataStoreChangeMetaParam(inp)
         log.info("[DS] ChangeMeta pid=%d data_id=%d flags=0x%X",
-                  pid, data_id, modifies_flag)
-        if modifies_flag & 0x08:
-            meta_binary = inp.qbuffer()
-            await _run(db.update_free_play_meta_binary, data_id, meta_binary, int(time.time()))
+                  pid, param.data_id, param.modifies_flag)
+
+        if param.modifies_flag & (0x08 | 0x10):
+            await _run(db.update_free_play_meta_binary, param.data_id, param.meta_binary, make_datetime_now())
         return encode_success(PROTO_DS, method, call_id, b"")
 
     elif method == M_PREPARE_UPDATE:
-        _skip_struct(inp)
-        data_id = inp.u64()
-        size    = inp.u32()
-        log.info("[DS] PrepareUpdateObject pid=%d data_id=%d size=%d", pid, data_id, size)
-        version     = await _run(db.get_version_by_data_id, data_id)
+        param = DataStorePrepareUpdateParam(inp)
+        log.info("[DS] PrepareUpdateObject pid=%d data_id=%d size=%d", pid, param.data_id, param.size)
+        version     = await _run(db.get_version_by_data_id, param.data_id)
         new_version = version + 1
-        key         = s3_store.data_key(data_id, new_version)
+        key         = s3_store.data_key(param.data_id, new_version)
+        form_fields = [
+            ("key", key),
+            ("acl", "private"),
+            ("signature", "signature"),
+        ]
+        upload_url  = s3_store.object_url("")
+        log.info("[DS] PrepareUpdateObject -> upload_url=%s key=%s newver=%d", upload_url, key, new_version)
         out         = StreamOut()
-        write_req_update_info(out, new_version, s3_store.object_url(key))
+        write_req_update_info(out, new_version, upload_url, form_fields)
         return encode_success(PROTO_DS, method, call_id, out.get())
 
     elif method == M_COMPLETE_UPDATE:
@@ -260,34 +284,21 @@ async def _ds_dispatch(method, call_id, params, pid):
         log.warning("[DS] Unknown method 0x%X pid=%d", method, pid)
         return encode_error(PROTO_DS, method, call_id, 0x80010002)
 
-
-def _skip_struct(inp: StreamIn):
-    # When structure headers are enabled (3DS NEX >= 30500), each structure
-    # parameter is prefixed with u8 version + u32 length. Consume it so the
-    # fields that follow line up.
-    from nex.types import USE_STRUCT_HEADER
-    if not USE_STRUCT_HEADER:
-        return
-    if inp.remaining() < 5:
-        return
-    _version = inp.u8()
-    _length  = inp.u32()
-
-
-# ── Shop Badge Arcade (0xC8) ──────────────────────────────────────────────────
-
 PROTO_SHOP         = 0xC8
 M_GET_RIV_TOKEN    = 0x1
 M_POST_PLAY_LOG    = 0x2
-
 
 async def handle_shop(method: int, call_id: int,
                        params: bytes, pid: int) -> bytes:
     inp = StreamIn(params)
     if method == M_GET_RIV_TOKEN:
         item_code = inp.string()
-        log.info("[Shop] GetRivToken pid=%d item=%r", pid, item_code)
-        out = StreamOut(); out.string("")
+        try:
+            reference_id = inp.qbuffer()
+        except Exception:
+            reference_id = b""
+        log.info("[Shop] GetRivToken pid=%d item=%r ref=%d bytes", pid, item_code, len(reference_id))
+        out = StreamOut(); out.string("dummytoken")
         return encode_success(PROTO_SHOP, method, call_id, out.get())
 
     elif method == M_POST_PLAY_LOG:
